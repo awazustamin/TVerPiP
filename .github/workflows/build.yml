@@ -1,0 +1,50 @@
+name: Build TVerPiP
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: HTTPS URL of a decrypted TVer ipa
+        required: true
+        type: string
+      ipa_sha256:
+        description: Optional SHA-256 of the input ipa
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      IPA_URL: ${{ inputs.ipa_url }}
+      IPA_SHA256: ${{ inputs.ipa_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download input ipa
+        run: |
+          mkdir -p packages
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --url "$IPA_URL" --output packages/jp.hamitv.hamitvapp1.ipa
+          unzip -tq packages/jp.hamitv.hamitvapp1.ipa
+
+      - name: Verify input ipa SHA-256
+        if: ${{ inputs.ipa_sha256 != '' }}
+        run: |
+          actual="$(shasum -a 256 packages/jp.hamitv.hamitvapp1.ipa | awk '{print $1}')"
+          test "$actual" = "$IPA_SHA256"
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TVerPiP
+          path: packages/TVerPiP.ipa
+          if-no-files-found: error
+          retention-days: 1

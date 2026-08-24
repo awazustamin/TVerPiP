@@ -1,0 +1,16 @@
+# macOS / editors
+.DS_Store
+*.swp
+*.swo
+
+# Generated or copyrighted application artifacts
+dist/
+*.ipa
+*.tipa
+*.deb
+Payload/
+
+# Local build products and device backups
+.theos/
+packages/
+backups/
