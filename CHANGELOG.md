@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 - 2026-10-23
+
+- Restored PiP startup on TVer 7.2.4.
+- Fixed PiP closing immediately after returning to the Home Screen.
+- Restored inline playback when returning to the app or using the PiP return control.
+
 ## 1.0.0 - 2026-08-25
 
 - Initial public release.

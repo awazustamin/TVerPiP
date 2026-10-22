@@ -48,7 +48,8 @@ swift "$SCRIPT_DIR/tools/TVerPiPPatcher.swift" patch-info "$INFO_PLIST"
 
 mkdir -p "$APP_PATH/Frameworks"
 xcrun clang -arch arm64 -isysroot "$SDK_PATH" -miphoneos-version-min=15.0 \
-  -fobjc-arc -fblocks -dynamiclib "$SCRIPT_DIR/Sources/TVerPiP.m" \
+  -fobjc-arc -fblocks -DTVERPIP_DIAGNOSTIC="${TVERPIP_DIAGNOSTIC:-0}" \
+  -dynamiclib "$SCRIPT_DIR/Sources/TVerPiP.m" \
   -framework Foundation -framework AVFoundation -framework AVKit \
   -framework MediaPlayer -framework UIKit -framework CoreMedia -framework CoreGraphics \
   -install_name '@executable_path/Frameworks/TVerPiP.dylib' \

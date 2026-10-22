@@ -11,6 +11,7 @@
 #endif
 
 static NSHashTable<AVPlayer *> *TVPlayers;
+static NSHashTable<AVPlayerLayer *> *TVLayers;
 static NSHashTable<MPRemoteCommand *> *TVCommands;
 static NSMutableArray *TVPiPObjects;
 static NSMapTable<AVPictureInPictureController *, AVPlayerLayer *> *TVControllerLayers;
@@ -19,6 +20,13 @@ static AVAudioEngine *TVSilentEngine;
 static AVAudioPlayerNode *TVSilentNode;
 static AVAudioPCMBuffer *TVSilentBuffer;
 static NSString *TVLogPath;
+static AVPlayerLayer *TVProtectedLayer;
+static BOOL TVPiPTransitionInProgress;
+
+@interface TVPiPObserver : NSObject <AVPictureInPictureControllerDelegate>
+@end
+
+static TVPiPObserver *TVObserver;
 
 static void TVRetainPiPObject(id object) {
     if (!object)
@@ -30,6 +38,7 @@ static void TVRetainPiPObject(id object) {
 
 static void TVLog(NSString *format, ...);
 static void TVStartBestController(BOOL useBackgroundProxy);
+static void TVEnsureController(void);
 
 static void TVLog(NSString *format, ...) {
     if (!TVERPIP_DIAGNOSTIC)
@@ -48,10 +57,43 @@ static void TVLog(NSString *format, ...) {
     }
 }
 
+@implementation TVPiPObserver
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
+    TVLog(@"PiP will start controller=%p", controller);
+}
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
+    TVLog(@"PiP did start controller=%p", controller);
+    TVPiPTransitionInProgress = YES;
+    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (controller.pictureInPictureActive &&
+              UIApplication.sharedApplication.applicationState == UIApplicationStateActive)
+              [controller stopPictureInPicture];
+        });
+    }
+}
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+    failedToStartPictureInPictureWithError:(NSError *)error {
+    TVLog(@"PiP failed controller=%p domain=%@ code=%ld", controller, error.domain,
+          (long)error.code);
+}
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    TVLog(@"PiP did stop controller=%p", controller);
+    TVPiPTransitionInProgress = NO;
+    TVProtectedLayer = nil;
+}
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completionHandler {
+    TVLog(@"PiP restore requested controller=%p", controller);
+    completionHandler(YES);
+}
+@end
+
 static void (*OrigPlayerPlay)(AVPlayer *, SEL);
 static void (*OrigPlayerPause)(AVPlayer *, SEL);
 static void (*OrigPlayerReplace)(AVPlayer *, SEL, AVPlayerItem *);
 static void (*OrigLayerSetPlayer)(AVPlayerLayer *, SEL, AVPlayer *);
+static id (*OrigLayerInitPlayer)(AVPlayerLayer *, SEL, AVPlayer *);
 static id (*OrigPiPInitLayer)(id, SEL, AVPlayerLayer *);
 static id (*OrigPiPInitSource)(id, SEL, AVPictureInPictureControllerContentSource *);
 static void (*OrigPiPSetAuto)(id, SEL, BOOL);
@@ -70,7 +112,19 @@ static void TVRememberPlayer(AVPlayer *player) {
     @synchronized(TVPlayers) {
         [TVPlayers addObject:player];
     }
-    TVLog(@"player remembered %@ item=%@ rate=%.2f", player, player.currentItem, player.rate);
+    TVLog(@"player remembered %p item=%d rate=%.2f", player, player.currentItem != nil,
+          player.rate);
+}
+
+static void TVRememberLayer(AVPlayerLayer *layer) {
+    if (!layer)
+        return;
+    @synchronized(TVLayers) {
+        [TVLayers addObject:layer];
+    }
+    TVRememberPlayer(layer.player);
+    TVLog(@"layer remembered %p player=%p ready=%d", layer, layer.player,
+          layer.readyForDisplay);
 }
 
 static AVPlayer *TVCurrentPlayer(void) {
@@ -184,10 +238,12 @@ static BOOL TVAnyPiPActive(void) {
 }
 
 static void TVScheduleKeepaliveSafetyTimeout(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
       if (!TVAnyPiPActive()) {
           TVLog(@"keepalive safety timeout: no active PiP");
           TVStopSilentKeepalive();
+          TVPiPTransitionInProgress = NO;
+          TVProtectedLayer = nil;
       }
     });
 }
@@ -210,7 +266,63 @@ static NSInteger TVControllerScore(AVPictureInPictureController *controller) {
     return score;
 }
 
+static AVPlayerLayer *TVBestPlayerLayer(void) {
+    NSArray<AVPlayerLayer *> *layers;
+    @synchronized(TVLayers) {
+        layers = TVLayers.allObjects;
+    }
+    AVPlayerLayer *best = nil;
+    NSInteger bestScore = NSIntegerMin;
+    AVPlayer *target = TVCurrentPlayer();
+    for (AVPlayerLayer *layer in layers) {
+        AVPlayer *player = layer.player;
+        NSInteger score = 0;
+        if (layer.superlayer)
+            score += 10;
+        if (layer.readyForDisplay)
+            score += 20;
+        if (player.currentItem)
+            score += 30;
+        if (player.rate > 0)
+            score += 40;
+        if (player == target && player)
+            score += 200;
+        if (score > bestScore) {
+            best = layer;
+            bestScore = score;
+        }
+        TVLog(@"layer candidate=%p player=%p score=%ld", layer, player, (long)score);
+    }
+    TVLog(@"best layer=%p score=%ld", best, (long)bestScore);
+    return bestScore >= 50 ? best : nil;
+}
+
+static void TVEnsureController(void) {
+    AVPlayerLayer *layer = TVBestPlayerLayer();
+    if (!layer)
+        return;
+    for (AVPictureInPictureController *controller in TVControllerLayers.keyEnumerator) {
+        if ([TVControllerLayers objectForKey:controller] == layer)
+            return;
+    }
+    AVPictureInPictureController *created =
+        [[AVPictureInPictureController alloc] initWithPlayerLayer:layer];
+    if (!created)
+        return;
+    created.canStartPictureInPictureAutomaticallyFromInline = YES;
+    created.delegate = TVObserver;
+    [TVControllerLayers setObject:layer forKey:created];
+    TVRetainPiPObject(layer);
+    TVRetainPiPObject(created);
+    TVLog(@"created PiP controller=%p layer=%p possible=%d", created, layer,
+          created.pictureInPicturePossible);
+}
+
 static void TVStartBestController(BOOL useBackgroundProxy) {
+    if (TVAnyPiPActive()) {
+        TVLog(@"PiP start skipped: already active");
+        return;
+    }
     AVPictureInPictureController *best = nil;
     NSInteger bestScore = NSIntegerMin;
     AVPlayer *targetPlayer = TVCurrentPlayer();
@@ -219,7 +331,7 @@ static void TVStartBestController(BOOL useBackgroundProxy) {
         AVPlayerLayer *layer = [TVControllerLayers objectForKey:controller];
         if (targetPlayer && layer.player == targetPlayer)
             score += 200;
-        TVLog(@"PiP candidate=%@ score=%ld possible=%d ready=%d active=%d", controller, (long)score,
+        TVLog(@"PiP candidate=%p score=%ld possible=%d ready=%d active=%d", controller, (long)score,
               controller.pictureInPicturePossible, layer.readyForDisplay,
               controller.pictureInPictureActive);
         if (!controller.pictureInPictureActive && score > bestScore) {
@@ -228,18 +340,35 @@ static void TVStartBestController(BOOL useBackgroundProxy) {
         }
     }
     if (!best || bestScore < 50) {
+        TVEnsureController();
+        for (AVPictureInPictureController *controller in TVControllerLayers.keyEnumerator) {
+            NSInteger score = TVControllerScore(controller);
+            if (!controller.pictureInPictureActive && score > bestScore) {
+                best = controller;
+                bestScore = score;
+            }
+        }
+    }
+    if (!best || bestScore < 50) {
         TVLog(@"PiP start skipped bestScore=%ld", (long)bestScore);
         return;
     }
     AVPlayer *player = [TVControllerLayers objectForKey:best].player ?: targetPlayer;
+    TVProtectedLayer = [TVControllerLayers objectForKey:best];
+    TVPiPTransitionInProgress = YES;
     if (player.currentItem && player.rate == 0) {
         TVLog(@"resuming target player before PiP");
         [player play];
     }
     TVStartSilentKeepalive();
     TVScheduleKeepaliveSafetyTimeout();
-    TVLog(@"PiP direct start controller=%@ score=%ld possible=%d backgroundProxy=%d", best,
+    TVLog(@"PiP direct start controller=%p score=%ld possible=%d backgroundProxy=%d", best,
           (long)bestScore, best.pictureInPicturePossible, useBackgroundProxy);
+    if (best.pictureInPicturePossible) {
+        TVLog(@"PiP public start controller=%p", best);
+        [best startPictureInPicture];
+        return;
+    }
     if (useBackgroundProxy) {
         @try {
             id adapter = [best valueForKey:@"platformAdapter"];
@@ -258,7 +387,7 @@ static void TVStartBestController(BOOL useBackgroundProxy) {
             if ([proxy respondsToSelector:autoSelector])
                 ((void (*)(id, SEL, BOOL))objc_msgSend)(proxy, autoSelector, YES);
             if ([proxy respondsToSelector:@selector(startPictureInPicture)]) {
-                TVLog(@"PiP background proxy start proxy=%@ adapter=%@", proxy, adapter);
+                TVLog(@"PiP background proxy start proxy=%p adapter=%p", proxy, adapter);
                 ((void (*)(id, SEL))objc_msgSend)(proxy, @selector(startPictureInPicture));
                 return;
             }
@@ -348,6 +477,9 @@ static void TVPlayerPlay(AVPlayer *self, SEL _cmd) {
     TVInstallCommands();
     OrigPlayerPlay(self, _cmd);
     TVUpdateNowPlaying(self);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      TVEnsureController();
+    });
 }
 static void TVPlayerPause(AVPlayer *self, SEL _cmd) {
     TVRememberPlayer(self);
@@ -357,15 +489,32 @@ static void TVPlayerPause(AVPlayer *self, SEL _cmd) {
 static void TVPlayerReplace(AVPlayer *self, SEL _cmd, AVPlayerItem *item) {
     TVRememberPlayer(self);
     OrigPlayerReplace(self, _cmd, item);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      TVEnsureController();
+    });
 }
 static void TVLayerSetPlayer(AVPlayerLayer *self, SEL _cmd, AVPlayer *p) {
+    if (!p && self == TVProtectedLayer && TVPiPTransitionInProgress) {
+        TVLog(@"preserved PiP player on layer=%p during background transition", self);
+        return;
+    }
     TVRememberPlayer(p);
     TVInstallCommands();
     OrigLayerSetPlayer(self, _cmd, p);
+    TVRememberLayer(self);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      TVEnsureController();
+    });
+}
+static id TVLayerInitPlayer(AVPlayerLayer *self, SEL _cmd, AVPlayer *player) {
+    id layer = OrigLayerInitPlayer(self, _cmd, player);
+    TVRememberLayer(layer);
+    return layer;
 }
 static id TVPiPInitLayer(id self, SEL _cmd, AVPlayerLayer *layer) {
     id obj = OrigPiPInitLayer(self, _cmd, layer);
-    TVLog(@"PiP init playerLayer=%@ controller=%@", layer, obj);
+    TVLog(@"PiP init playerLayer=%p controller=%p", layer, obj);
+    TVRememberLayer(layer);
     TVRememberPlayer(layer.player);
     TVRetainPiPObject(obj);
     TVRetainPiPObject(layer);
@@ -375,7 +524,8 @@ static id TVPiPInitLayer(id self, SEL _cmd, AVPlayerLayer *layer) {
 }
 static id TVPiPInitSource(id self, SEL _cmd, AVPictureInPictureControllerContentSource *source) {
     id obj = OrigPiPInitSource(self, _cmd, source);
-    TVLog(@"PiP init contentSource=%@ controller=%@", source, obj);
+    TVLog(@"PiP init contentSource=%p controller=%p", source, obj);
+    TVRememberLayer(source.playerLayer);
     TVRememberPlayer(source.playerLayer.player);
     TVRetainPiPObject(obj);
     TVRetainPiPObject(source);
@@ -386,7 +536,7 @@ static id TVPiPInitSource(id self, SEL _cmd, AVPictureInPictureControllerContent
 }
 static void TVPiPSetAuto(id self, SEL _cmd, BOOL enabled) { OrigPiPSetAuto(self, _cmd, YES); }
 static void TVPiPStart(id self, SEL _cmd) {
-    TVLog(@"PiP start requested controller=%@", self);
+    TVLog(@"PiP start requested controller=%p", self);
     TVStartSilentKeepalive();
     TVScheduleKeepaliveSafetyTimeout();
     TVRetainPiPObject(self);
@@ -438,6 +588,8 @@ __attribute__((constructor)) static void TVerPiPInit(void) {
           NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
           TVLog(@"initializing delayed hooks bundle=%@", bundleID);
           TVPlayers = [NSHashTable weakObjectsHashTable];
+          TVObserver = [TVPiPObserver new];
+          TVLayers = [NSHashTable weakObjectsHashTable];
           TVCommands = [NSHashTable weakObjectsHashTable];
           TVPiPObjects = [NSMutableArray array];
           TVControllerLayers = [NSMapTable weakToWeakObjectsMapTable];
@@ -447,6 +599,8 @@ __attribute__((constructor)) static void TVerPiPInit(void) {
                  (void **)&OrigPlayerReplace);
           TVHook(AVPlayerLayer.class, @selector(setPlayer:), (IMP)TVLayerSetPlayer,
                  (void **)&OrigLayerSetPlayer);
+          TVHook(AVPlayerLayer.class, @selector(initWithPlayer:), (IMP)TVLayerInitPlayer,
+                 (void **)&OrigLayerInitPlayer);
           TVHook(AVPictureInPictureController.class, @selector(initWithPlayerLayer:),
                  (IMP)TVPiPInitLayer, (void **)&OrigPiPInitLayer);
           TVHook(AVPictureInPictureController.class, @selector(initWithContentSource:),
@@ -485,7 +639,14 @@ __attribute__((constructor)) static void TVerPiPInit(void) {
                           object:nil
                            queue:NSOperationQueue.mainQueue
                       usingBlock:^(NSNotification *note) {
-                        TVLog(@"application became active: stopping PiP keepalive");
+                        TVLog(@"application became active: restoring inline playback");
+                        for (AVPictureInPictureController *controller in
+                             TVControllerLayers.keyEnumerator) {
+                            if (controller.pictureInPictureActive)
+                                [controller stopPictureInPicture];
+                        }
+                        TVPiPTransitionInProgress = NO;
+                        TVProtectedLayer = nil;
                         TVStopSilentKeepalive();
                       }];
           TVLog(@"hook initialization complete");
