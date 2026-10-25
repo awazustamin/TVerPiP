@@ -21,7 +21,7 @@ TVerの動画を、ホーム画面へ戻ったときにPicture in Picture（PiP�
 - `zip`と`unzip`
 - 利用者自身が適法に用意した復号済みTVer ipa
 
-TVer `7.2.4`とiOS `17.3.1`で動作確認しています。
+TVer `7.2.5`とiOS `17.3.1`で動作確認しています。
 
 ## Building TVerPiP
 
