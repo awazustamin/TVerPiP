@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 - 2026-11-21
+
+- Fixed a startup crash during Picture in Picture (PiP) controller initialization on TVer 7.4.2.
+- Excluded TVer Home previews from automatic PiP.
+- Kept playback paused when returning to the iOS Home Screen while a video is paused.
+
 ## 1.1.0 - 2026-10-23
 
 - Restored PiP startup on TVer 7.2.4.
